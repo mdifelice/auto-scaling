@@ -1,0 +1,597 @@
+#!/usr/bin/php
+<?php
+/**
+ * Script that automates syncing instances running in a auto scaling group.
+ *
+ * @package AWS_Tools
+ */
+
+/**
+ * Include Amazon library.
+ */
+require_once __DIR__ . '/include/aws.php';
+
+/**
+ * Include scripts generic functions.
+ */
+require_once __DIR__ . '/include/functions.php';
+
+/**
+ * This function prints information about this script usage.
+ */
+function print_help() {
+	print(
+	"Usage: 
+
+deploy -a <AUTO_SCALING_GROUP> [-w] [-h] [-t] (-s <SOURCE>|-i <INCLUDE>) -d <DESTINATION> -k <KEY_PAIR_FILE>
+
+Description: 
+
+This program synchronices the files between a folder on the running machine and instances in an Amazon auto scaling group.
+
+Options:
+
+-a <AUTO_SCALING_GROUP> Name of the auto scaling group to synchronice.
+-s <SOURCE>             Local content to synchronice.
+-i <INCLUDE>            File, or list of files separated by a comma, to
+                        include in the syncronization.
+                        The 'source' argument is not mandatory if this
+                        argument is specified.
+-d <DESTINATION>        Remote content to synchronice.
+                        If the 'include' argument is specified, it will be used
+                        to specify as a base folder for each file. In that case
+                        is not mandatory, and the root will be used as base
+                        folder.
+-w                      Waits for user confirmation before creating the 
+                        new image.
+-r                      Restart whole system (takes more time).
+-t                      Temporal sync (not definitive, it is faster and 
+                        intended for testing purposes).
+-b                      Keeps old image. By default it is deleted.
+-k                      Path to key pair file.
+-h                      Prints this help.
+
+");
+}
+
+/**
+ * Returns the list of processes that will be suspended and resumed during the
+ * synchronization.
+ *
+ * We do not want to suspend all the processes, only those which create new
+ * instances in order to avoid new instances with an old configuration be
+ * launched during the synchronization.
+ *
+ * If an instance was launched during a regular synchronization it could not
+ * get the new files and that instance would remain outdated.
+ *
+ * In a reset synchronization (-r option) suspending processes would not
+ * have an impact since all instances are replaced and that is why we only
+ * suspend processes on regular synchronizations.
+ *
+ * In a future, the regular synchronization process could be changed to be
+ * done before creating the image in order to speed up deployments and
+ * suspending auto scaling processes is a good first step to guarantee the
+ * system integrity.
+ *
+ * @return array List of processes to suspend or resume.
+ */
+function get_auto_scaling_processes() {
+	return array(
+		'Launch',
+	);
+}
+
+/**
+ * First we parse the arguments.
+ *
+ * @var boolean $wait_before_create_image Indicates if before creating
+ * a new image the process should stop waiting for user input. It is useful
+ * in cases we want to tweak something in the temporal instance used to
+ * generate the image (some server settings for example), so those changes
+ * will be reflected in the generated image.
+ * @var boolean $restart_system Indicates if all the instances inside the
+ * auto scaling group should be restarted after the sync took place.
+ * @var string auto_scaling_group_name The name of the auto scaling group to
+ * sync.
+ * @var string $source The source content to synchronize.
+ * If not provided, it will assume the base folder is empty (so it will
+ * use relative paths). If the variable is empty and no files were specified
+ * the program will not run. This is done to avoid accidently sync the whole
+ * file system.
+ * @var string $destination Where to place the sychronized content.
+ * If not provided, it will assume the base folder is the root.
+ * In case no files were provided, this parameter becomes mandatory to avoid
+ * accidently overwriting the whole file system.
+ * @var boolean $keep_old_image Whether to keep the old image or not.
+ */
+set_time_limit( 0 );
+
+$wait_before_create_image 	= false;
+$restart_system				= false;
+$temporal_sync				= false;
+$source						= '';
+$destination				= '';
+$auto_scaling_group_name	= null;
+$keep_old_image				= false;
+$key_pair_path				= null;
+
+$include_files		= array();
+$start_time 		= time();
+$return				= 0;
+
+if ( ! empty( $argv ) ) {
+	$count_argv = count( $argv );
+
+	for ( $i = 1; $i < $count_argv; $i++ ) {
+		switch ( $argv[ $i ] ) {
+			case '-f':
+				if ( $i < $count_argv - 1 ) {
+					/**
+					 * Files can be separated by a comma, so we split the
+					 * string in commas and apply the trim function to
+					 * eliminate extra spaces, and the array_filter function to
+					 * eliminate empty file names.
+					 */
+					$include_files =
+						array_filter(
+							array_map( 'trim',
+								explode( ',', $argv[ $i + 1 ] )
+							)
+						);
+
+					$i++;
+				}
+				break;
+			case '-a':
+				if ( $i < $count_argv - 1 ) {
+					$auto_scaling_group_name = $argv[ $i + 1 ];
+
+					$i++;
+				}
+				break;
+			case '-s':
+				if ( $i < $count_argv - 1 ) {
+					$source = $argv[ $i + 1 ];
+
+					$i++;
+				}
+				break;
+			case '-d':
+				if ( $i < $count_argv - 1 ) {
+					$destination = $argv[ $i + 1 ];
+
+					$i++;
+				}
+				break;
+			case '-k':
+				if ( $i < $count_argv - 1 ) {
+					$key_pair_path = $argv[ $i + 1 ];
+
+					$i++;
+				}
+				break;
+			case '-w':
+				$wait_before_create_image = true;
+				break;
+			case '-r':
+				$restart_system = true;
+				break;
+			case '-t':
+				$temporal_sync = true;
+				break;
+			case '-b':
+				$keep_old_image = true;
+				break;
+			case '-h':
+				print_help();
+
+				die();
+		}
+	}
+}
+
+try {
+	if ( check_if_process_is_running( sprintf( 'deploy-%s', $auto_scaling_group_name ) ) ) {
+		throw new Exception( 'A synchronization process for this auto scaling group is already running.' );
+	}
+
+	/**
+	 * If the system is being restarted, it will not be checked if there are
+	 * files to sync.
+	 */
+	if ( empty( $include_files ) && ( empty( $source ) || empty( $destination ) ) && ! $restart_system ) {
+		throw new Exception( 'There are no files to sync. Check out the help with the -h option.' );
+	}
+
+	$files_mapping = array();
+
+	if ( empty( $include_files ) ) {
+		if ( ! empty( $source ) && ! empty( $destination ) ) {
+			$files_mapping[ $source ] = $destination;
+		}
+	} else {
+		foreach ( $include_files as $include_file ) {
+			$local_file = $source . $include_file;
+
+			if ( ! file_exists( $local_file ) ) {
+				throw new Exception( sprintf( 'The file you are trying to sync does not exist (%s).', $local_file ) );
+			}
+
+			$remote_file = $destination . $include_file;
+
+			$files_mapping[ $local_file ] = $remote_file;
+		}
+	}
+
+	if ( empty( $auto_scaling_group_name ) ) {
+		throw new Exception( 'Missing auto scaling group. Check out the help with the -h option.' );
+	}
+
+	aws_init();
+
+	/**
+	 * For temporal syncs we do not need to create a new image.
+	 */
+	if ( ! $temporal_sync ) {
+		message( 'Loading auto scaling group...' );
+
+		$auto_scaling_group = get_auto_scaling_group( $auto_scaling_group_name );
+
+		if ( ! $auto_scaling_group ) {
+			throw new Exception( 'Invalid auto scaling group (or no permissions to load it).' );
+		}
+
+		$old_launch_configuration_name = $auto_scaling_group['LaunchConfigurationName'];
+
+		message( 'Loading launch configuration...' );
+
+		$old_launch_configuration = get_launch_configuration( $old_launch_configuration_name );
+
+		if ( ! $old_launch_configuration ) {
+			throw new Exception( 'Cannot load launch configuration.' );
+		}
+
+		$old_image_id = $old_launch_configuration['ImageId'];
+
+		/**
+		 * In case the auto scaling group resides inside a VPC, we will attempt
+		 * to identify a subnet where to create the new temporal instance.
+		 *
+		 * If there are more than one subnet, we will use the first one.
+		 *
+		 * Also, we will use the launch configuration to detect which security
+		 * groups will be used.
+		 */
+		$subnet_id       = null;
+		$security_groups = null;
+
+		if ( ! empty( $auto_scaling_group['VPCZoneIdentifier'] ) ) {
+			$subnet_ids = explode( ',', $auto_scaling_group['VPCZoneIdentifier'] );
+
+			if ( ! empty( $subnet_ids ) ) {
+				$subnet_id = $subnet_ids[0];
+			}
+		}
+
+		if ( ! empty( $old_launch_configuration['SecurityGroups'] ) ) {
+			$security_groups = $old_launch_configuration['SecurityGroups'];
+		}
+
+		message( 'Launching temporal instance...' );
+
+		$temporal_instance = run_instance( $old_image_id, $subnet_id, $security_groups );
+
+		$temporal_instance_id = $temporal_instance['InstanceId'];
+
+		create_tags( $temporal_instance_id, array(
+			'Name'			=> 'Multimedia Ops - Temporal',
+			'Description'	=> sprintf( 'Temporal instance for syncing autoscaling group %s.', $auto_scaling_group_name ),
+		) );
+
+		message( sprintf( 'Waiting temporal instance to be ready (Instance: %s)...', $temporal_instance_id ) );
+
+		wait_instance( $temporal_instance_id, array(
+			'status' => 'ok',
+		) );
+
+		message( 'Synchronizing new content to temporal instance...' );
+
+		if ( ! sync_content( $files_mapping, $key_pair_path, $temporal_instance['PrivateIpAddress'] ) ) {
+			throw new Exception( 'Cannot synchronize files.' );
+		}
+
+		if ( $wait_before_create_image ) {
+			message( 'Press any key to continue...' );
+
+			wait_for_user_input();
+		}
+
+		message( 'Stopping temporal instance...' );
+
+		stop_instance( $temporal_instance_id );
+
+		message( 'Waiting temporal instance to be stopped...' );
+
+		wait_instance( $temporal_instance_id, array(
+			'state' => 'stopped',
+		) );
+
+		message( sprintf( 'Loading old image (Image: %s)...', $old_image_id ) );
+
+		$old_image = get_image( $old_image_id );
+
+		if ( ! $old_image ) {
+			throw new Exception( 'Cannot load old image.' );
+		}
+
+		$old_image_name = $old_image['Name'];
+
+		/**
+		 * If the process hangs before this point, we only need to
+		 * delete the temporal instance and run it again.
+		 */
+		message( 'Creating new image...' );
+
+		/**
+		 * Images created by this script have an alphanumerical name,
+		 * a dot, a then a number version.
+		 *
+		 * If we do not find a version number, we assume it is the
+		 * first sync, and we the version will be one (1).
+		 *
+		 * Note: do not use dots while naming original images, it will
+		 * cause an error while creating new versions.
+		 */
+		$parsed_image_name = explode( '.', $old_image_name );
+
+		$image_basename = $parsed_image_name[0];
+		$image_version 	= isset( $parsed_image_name[1] ) ?
+			( (int) $parsed_image_name[1] + 1 ) :
+			'1';
+
+		$new_image_name = sprintf( '%s.%s',
+			$image_basename,
+			$image_version
+		);
+
+		$new_image_id = create_image( $new_image_name, $temporal_instance_id );
+
+		message( 'Waiting new image to be ready...' );
+
+		wait_image( $new_image_id );
+
+		message( 'Terminating temporal instance...' );
+
+		terminate_instance( $temporal_instance_id );
+
+		message( 'Creating new launch configuration...' );
+
+		$new_launch_configuration_name = $new_image_name;
+
+		create_launch_configuration( $new_launch_configuration_name, $new_image_id, $old_launch_configuration );
+
+		message( 'Updating auto scaling group...' );
+
+		set_launch_configuration( $new_launch_configuration_name, $auto_scaling_group_name );
+
+		message( 'Deleting old launch configuration...' );
+
+		delete_launch_configuration( $old_launch_configuration_name );
+
+		if ( ! $keep_old_image ) {
+			message( 'Deregistering old image...' );
+
+			deregister_image( $old_image_id );
+
+			foreach ( $old_image['BlockDeviceMappings'] as $block_device_mapping ) {
+				$old_snapshot_id = $block_device_mapping['Ebs']['SnapshotId'];
+
+				message( sprintf( 'Deleting old snapshot %s...', $old_snapshot_id ) );
+
+				delete_snapshot( $old_snapshot_id );
+			}
+		}
+	}
+
+	message( sprintf( '%s auto scaling group...', $temporal_sync ? 'Loading' : 'Reloading' ) );
+
+	$auto_scaling_group = get_auto_scaling_group( $auto_scaling_group_name );
+
+	if ( ! $auto_scaling_group ) {
+		throw new Exception( 'Invalid auto scaling group (or no permissions to load it).' );
+	}
+
+	$old_instances = $auto_scaling_group['Instances'];
+
+	/**
+	 * We only will restart the system if it was not temporal sync,
+	 * and that is because if we do a temporal sync a then restart
+	 * the system it will have no effect.
+	 *
+	 * So, definitively, if we perform a temporal sync, the restart
+	 * system parameter will not have any effect.
+	 */
+	if ( $restart_system && ! $temporal_sync ) {
+		if ( empty( $old_instances ) ) {
+			throw new Exception( 'The system has no instances running. Please check why.' );
+		}
+
+		/**
+		 * In order to restart the auto scaling system we will duplicate the
+		 * desired capacity. If we cannot duplicate it because it exceeds the
+		 * maximum capacity, we set the desired capacity to its maximum.
+		 *
+		 * The new instances will be created with the new image. As soon a new
+		 * instance is created, we will eliminate an old image, until there are
+		 * no old images. So, when this process finishes we will be sure that
+		 * only new instances are running.
+		 */
+		$old_desired_capacity	= $auto_scaling_group['DesiredCapacity'];
+		$new_desired_capacity 	= $old_desired_capacity * 2;
+
+		if ( $new_desired_capacity > $auto_scaling_group['MaxSize'] ) {
+			$new_desired_capacity = $auto_scaling_group['MaxSize'];
+		}
+
+		/**
+		 * The system is at its full capacity hence we need to terminate at
+		 * least one instance in order to force the system create new
+		 * instances.
+		 */
+		if ( $new_desired_capacity === $old_desired_capacity ) {
+			if ( 1 === $new_desired_capacity ) {
+				throw new Exception( 'Impossible to restart since the system only allows one instance running at a time. Maximum value should be modified before trying again.' );
+			}
+
+			/**
+			 * We update this variable to force the system to update.
+			 */
+			$old_desired_capacity--;
+
+			$first_old_instance = array_shift( $old_instances );
+
+			$first_old_instance_id = $first_old_instance['InstanceId'];
+
+			message( sprintf( 'Terminating first found old instance (%s)...', $first_old_instance_id ) );
+
+			terminate_instance_in_auto_scaling_group( $first_old_instance_id, false );
+		} else {
+			message( sprintf( 'Setting auto scaling group desired capacity: %s...', $new_desired_capacity ) );
+
+			set_desired_capacity( $auto_scaling_group_name, $new_desired_capacity );
+		}
+
+		message( 'Waiting for new instances...' );
+
+		while ( ! empty( $old_instances ) ) {
+			$auto_scaling_group = get_auto_scaling_group( $auto_scaling_group_name );
+
+			if ( ! $auto_scaling_group ) {
+				throw new Exception( 'Cannot fetch auto scaling group.' );
+			}
+
+			$old_instances = array();
+			$new_instances = array();
+
+			foreach ( $auto_scaling_group['Instances'] as $instance ) {
+				/**
+				 * We only considerate running instances. For that we check
+				 * its LifecycleState inside the group and its status. Both
+				 * conditions should match to consider an instance running.
+				 */
+				if ( 'InService' === $instance['LifecycleState'] && 'ok' === get_instance_status( $instance['InstanceId'] ) ) {
+					/**
+					 * If LaunchConfigurationName is not set it can mean that
+					 * is an old instance which has been launched using a
+					 * launch configuration already deleted, or it is an
+					 * instance manually added.
+					 */
+						if ( isset( $instance['LaunchConfigurationName'] ) && $instance['LaunchConfigurationName'] === $new_launch_configuration_name ) {
+						$new_instances[] = $instance;
+					} else {
+						$old_instances[] = $instance;
+					}
+				}
+			}
+
+			/**
+			 * We can speed up the process by terminating old instances.
+			 *
+			 * How many old instances we can terminate is determined by the
+			 * number of instances the system has less the number of instances
+			 * the system should have ($old_desired_capacity).
+			 */
+			$instances_to_terminate = ( count( $new_instances ) + count( $old_instances ) ) - $old_desired_capacity;
+
+			for ( $i = 0; $i < $instances_to_terminate && ! empty( $old_instances ); $i++ ) {
+				$old_instance = array_shift( $old_instances );
+
+				$old_instance_id = $old_instance['InstanceId'];
+
+				message( sprintf( 'Terminating old instance (%s)...', $old_instance_id ) );
+
+				terminate_instance_in_auto_scaling_group( $old_instance_id, true );
+			}
+
+			/**
+			 * We wait one second to not overwhelm the API.
+			 */
+			sleep( 1 );
+		}
+	} else {
+		message( 'Suspending auto scaling processes...' );
+
+		suspend_auto_scaling_processes( $auto_scaling_group_name );
+
+		$old_instances_ids = array();
+
+		foreach ( $old_instances as $old_instance ) {
+			$old_instances_ids[] = $old_instance['InstanceId'];
+		}
+
+		message( 'Loading current instances data...' );
+
+		/**
+		 * We have the old instances, but we need more data, specificly their
+		 * statuses and addresses.
+		 */
+		$old_instances_extended = get_instances( $old_instances_ids );
+
+		$counter = 0;
+
+		foreach ( $old_instances_extended as $old_instance_extended ) {
+			$counter++;
+
+			$old_instance_id 		= $old_instance_extended['InstanceId'];
+			$old_instance_state		= $old_instance_extended['State']['Name'];
+
+			/**
+			 * If the instance is running we will attemp to sync. If there was
+			 * an error during syncing we will not stop because maybe the
+			 * instance suffered an state change, we simply inform that error.
+			 */
+			if ( 'running' === $old_instance_state ) {
+				message( sprintf( 'Synchronizing new content to instance %s (%s of %s)',
+					$old_instance_id,
+					$counter,
+					count( $old_instances_extended )
+				) );
+
+				if ( ! sync_content( $files_mapping, $key_pair_path, $old_instance_extended['PrivateIpAddress'] ) ) {
+					error( 'Cannot sync files.' );
+				}
+
+				/**
+				 * If it was not a temporal sync, we update the instance
+				 * description.
+				 */
+				if ( ! $temporal_sync ) {
+					create_tags( $old_instance_id, array(
+						'Description' => sprintf( 'Synced with image %s.', $new_image_name ),
+					) );
+				}
+			} else {
+				message( sprintf( 'Skipping instance %s (status %s)', $old_instance_id, $old_instance_state ) );
+			}
+		}
+
+		message( 'Resuming auto scaling processes...' );
+
+		resume_auto_scaling_processes( $auto_scaling_group_name );
+	}
+} catch ( Exception $e ) {
+	error( $e->getMessage() );
+
+	$return = -1;
+}
+
+$elapsed_time = time() - $start_time;
+
+message( sprintf(
+	'Finished (Total time: %02d:%02d)',
+	floor( $elapsed_time / 60 ),
+	$elapsed_time % 60
+) );
+
+exit( $return );

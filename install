@@ -1,0 +1,495 @@
+#!/usr/bin/php
+<?php
+/**
+ * Script installs a base autoscaling system.
+ *
+ * @package AWS_Tools
+ */
+
+/**
+ * Include Amazon library.
+ */
+require_once __DIR__ . '/include/aws.php';
+
+/**
+ * Include scripts generic functions.
+ */
+require_once __DIR__ . '/include/functions.php';
+
+/**
+ * This function prints information about this script usage.
+ */
+function print_help() {
+	print(
+	"Usage: 
+
+install -n <NAME> [-g <APPLICATION_GIT_URL>] [-p <DATABASE_PASSWORD>] [-s <DEV_SECURITY_GROUP>] -u
+
+Description: 
+
+This program installs the necessary programs that are needed to start an autoscaling instance.
+
+Options:
+
+-n <NAME>                Name of the system. It should be an alphanumeric value
+                         and it will be used as prefix for naming resources.
+-g <APPLICATION_GIT_URL> If provided, the indicated repository will be
+                         downloaded and deployed.
+-p <DATABASE_PASSWORD>   Indicates the database password. If not provided, the
+                         script will randomly generates one and show it.
+-s <DEV_SECURITY_GROUP>  Indicates the security group from where deployments
+                         will be made. If not provided, it will use current
+						 instance security group, if there is one.
+-u                       Performs an unistallation.
+-h                       Prints this help.
+
+");
+}
+
+set_time_limit( 0 );
+
+$name                = null;
+$application_git_url = null;
+$database_username   = 'root';
+$database_password   = null;
+$security_group_dev  = null;
+$return              = 0;
+$start_time          = time();
+$uninstall           = false;
+
+if ( ! empty( $argv ) ) {
+	$count_argv = count( $argv );
+
+	for ( $i = 1; $i < $count_argv; $i++ ) {
+		switch ( $argv[ $i ] ) {
+			case '-n':
+				if ( $i < $count_argv - 1 ) {
+					$name = $argv[ $i + 1 ];
+
+					$i++;
+				}
+				break;
+			case '-g':
+				if ( $i < $count_argv - 1 ) {
+					$application_git_url = $argv[ $i + 1 ];
+
+					$i++;
+				}
+				break;
+			case '-p':
+				if ( $i < $count_argv - 1 ) {
+					$database_password = $argv[ $i + 1 ];
+
+					$i++;
+				}
+				break;
+			case '-s':
+				if ( $i < $count_argv - 1 ) {
+					$security_group_dev = $argv[ $i + 1 ];
+
+					$i++;
+				}
+				break;
+			case '-u':
+				$uninstall = true;
+				break;
+			case '-h':
+				print_help();
+
+				die();
+		}
+	}
+}
+
+try {
+	if ( ! $name ) {
+		throw new Exception( 'Missing system name.' );
+	}
+
+	if ( ! preg_match( '/^[a-zA-Z0-9]+$/i', $name ) ) {
+		throw new Exception( 'Name must be an alphanumeric value.' );
+	}
+
+	if ( check_if_process_is_running( sprintf( 'install-%s', $name ) ) ) {
+		throw new Exception( 'A install process for this name is already running.' );
+	}
+
+	aws_init();
+
+	/**
+	 * Resource names.
+	 */ 
+	$autoscaling_group_name       = $name;
+	$load_balancer_name           = $name;
+	$security_group_instances     = sprintf( '%s-ec2', $name );
+	$security_group_database      = sprintf( '%s-rds', $name );
+	$db_name                      = $name;
+	$ec2_image_name               = $name;
+	$launch_configuration_name    = $name;
+	$as_policy_scale_in           = sprintf( '%s-in', $name );
+	$as_policy_scale_out          = sprintf( '%s-out', $name );
+	$key_pair_name                = $name;
+
+	$key_pair_location            = sprintf( __DIR__ . '/%s.pem', $name );
+	$application_source           = __DIR__ . '/application';
+	$application_destination      = '/var/www/html';
+	$db_allocated_storage         = 30;
+	$db_instance_class            = 'db.m1.small';
+	$db_engine                    = 'mysql';
+	$sg_lb_description            = 'Load Balancer security group';
+	$sg_ec2_description           = 'EC2 instances security group';
+	$sg_rds_description           = 'RDS security group';
+	/**
+	 * Base image: Ubuntu Server 16.04 LTS (HVM), SSD Volume Type
+	 */ 
+	$ec2_base_image_id            = 'ami-6e1a0117';
+	$ec2_instance_type            = 'm3.medium';
+	$autoscaling_group_min_size   = 1;
+	$autoscaling_group_max_size   = 20;
+
+	if ( $uninstall ) {
+		message( 'Uninstalling system...' );
+
+		message( 'Deleting system base...' );
+
+		system( sprintf( 'rm -rf %s', escapeshellarg( $application_source ) ) );
+
+		$db_instance = get_rds_instance( $db_name );
+
+		if ( $db_instance ) {
+			if ( 'deleting' !== $db_instance['DBInstanceStatus'] ) {
+				message( sprintf( 'Terminating DB instance %s...', $db_name ) );
+
+				delete_rds_instance( $db_name );
+			}
+
+			message( 'Waiting DB instance to terminate...' );
+
+			while ( $db_instance ) {
+				sleep( 1 );
+
+				$db_instance = get_rds_instance( $db_name );
+			}
+		}
+
+		message( 'Deleting security groups...' );
+
+		$autoscaling_group = get_auto_scaling_group( $autoscaling_group_name );
+
+		if ( $autoscaling_group ) {
+			message( 'Deleting autoscaling group...' );
+
+			delete_autoscaling_group( $autoscaling_group_name );
+		}
+
+		try {
+			message( 'Deleting alarms...' );
+
+			delete_alarms( array(
+				$as_policy_scale_in,
+				$as_policy_scale_out,
+			) );
+		} catch( Exception $e ) {
+			message( 'Could not delete alarms.' );
+		}
+
+		try {
+			delete_security_group( $security_group_instances );
+		} catch( Exception $e ) {
+			message( 'Could not delete instances security group.' );
+		}
+
+		try {
+			delete_rds_security_group( $security_group_database );
+		} catch( Exception $e ) {
+			message( 'Could not delete DB security group.' );
+		}
+
+		message( 'Deleting key pair...' );
+
+		try {
+			if ( file_exists( $key_pair_location ) ) {
+				unlink( $key_pair_location );
+			}
+
+			delete_key_pair( $key_pair_name );
+		} catch( Exception $e ) {
+			message( 'Could not delete key pair.' );
+		}
+
+		message( 'Deleting launch configuration...' );
+
+		try {
+			delete_launch_configuration( $launch_configuration_name );
+		} catch( Exception $e ) {
+			message( 'Could not delete launch configuration' );
+		}
+
+		$load_balancer = get_load_balancer( $load_balancer_name );
+
+		if ( $load_balancer ) {
+			$attributes = describe_load_balancer_attributes( $load_balancer_name );
+
+			if ( $attributes['AccessLog']['Enabled'] ) {
+				$bucket = $attributes['AccessLog']['S3BucketName'];
+
+				message( sprintf( 'Deleting log bucket %s...', $bucket ) );
+
+				try {
+					delete_bucket( $bucket );
+				} catch( Exception $e ) {
+					message( 'Could not delete bucket.' );
+				}
+			}
+
+			message( 'Deleting load balancer...' );
+
+			delete_load_balancer( $load_balancer_name );
+		}
+
+		$ec2_image = get_image_by_name( $ec2_image_name );
+
+		if ( $ec2_image ) {
+			$ec2_image_id = $ec2_image['ImageId'];
+
+			message( sprintf( 'Deregistering image %s...', $ec2_image_id ) );
+
+			deregister_image( $ec2_image_id );
+
+			foreach ( $ec2_image['BlockDeviceMappings'] as $block_device_mapping ) {
+				if ( isset( $block_device_mapping['Ebs'] ) ) {
+					$snapshot_id = $block_device_mapping['Ebs']['SnapshotId'];
+
+					message( sprintf( 'Deleting snapshot %s...', $snapshot_id ) );
+
+					delete_snapshot( $snapshot_id );
+				}
+			}
+		}
+	} else {
+		$programs = array(
+			'apache2',
+			'php7.0',
+			'php7.0-mysqli',
+			'php7.0-intl',
+			'php7.0-dom',
+			'php7.0-mbstring',
+			'libapache2-mod-php',
+			'unzip',
+		);
+
+		if ( file_exists( $application_source ) ) {
+			throw new Exception( 'The system base already exists. Cannot continue.' );
+		}
+
+		if ( $application_git_url ) {
+			system( sprintf( 'git clone %s %s', escapeshellarg( $application_git_url ), escapeshellarg( $application_source ) ), $error );
+
+			if ( $error ) {
+				throw new Exception( 'Cannot clone Git repository.' ); 
+			}
+		} elseif ( ! mkdir( $application_source ) ) {
+			throw new Exception( 'Cannot create system base folder.' );
+		}
+
+		if ( ! $security_group_dev ) {
+			message( 'Attempting to guess local security group...' );
+
+			$security_groups = get_instance_metadata( 'security-groups' );
+
+			if ( ! empty( $security_groups ) ) {
+				$security_group_dev = $security_groups[0];
+
+				message( sprintf( 'Local security group is %s.', $security_group_dev ) );
+			}
+		}
+
+		if ( ! $database_password ) {
+			$database_password = uniqid();
+
+			message( sprintf( 'Database password randomly generated (please note it down): %s', $database_password ) );
+		}
+
+		message( 'Creating instances security group...' );
+
+		create_security_group( $security_group_instances, $sg_ec2_description, array(
+			array(
+				'IpProtocol' => 'tcp',
+				'CidrIp'     => '0.0.0.0/0',
+				'FromPort'   => 80,
+				'ToPort'     => 80,
+			),
+			array(
+				'SourceSecurityGroupName' => $security_group_dev,
+			),
+		) );
+
+		message( 'Creating database security group...' );
+
+		create_rds_security_group( $security_group_database, $sg_rds_description, array(
+			array(
+				'EC2SecurityGroupName' => $security_group_instances,
+			),
+		) );
+
+		message( 'Creating database instance...' );
+
+		create_rds_instance( $db_engine, $db_name, $db_allocated_storage, $db_instance_class, $database_username, $database_password, array( $security_group_database ) );
+
+		message( 'Waiting DB instance to be ready...' );
+
+		do {
+			$db_instance = get_rds_instance( $db_name );
+
+			if ( isset( $db_instance['Endpoint'] ) ) {
+				$db_instance_address = $db_instance['Endpoint']['Address'];
+			}
+
+			sleep( 1 );
+		} while ( empty( $db_instance_address ) );
+
+		message( 'Creating key pair...' );
+
+		$material = create_key_pair( $key_pair_name );
+
+		if ( ! file_put_contents( $key_pair_location, $material ) ) {
+			throw new Exception( 'Cannot save key pair.' );
+		}
+
+		if ( ! chmod( $key_pair_location, 0600 ) ) {
+			throw new Exception( 'Cannot set key pair mod.' );
+		}
+
+		message( 'Creating temporal instance...' );
+
+		$ec2_instance = run_instance( $ec2_base_image_id, null, array( $security_group_instances ), $key_pair_name );
+
+		$ec2_instance_id = $ec2_instance['InstanceId'];
+
+		create_tags( $ec2_instance_id, array(
+			'Name' => sprintf( '%s-temporal', $name ),
+		) );
+
+		message( 'Waiting temporal instance to be running...' );
+
+		wait_instance( $ec2_instance_id, array(
+			'status' => 'ok',
+		) );
+
+		$ec2_instance_address = null;
+
+		message( 'Wait for instance private address...' );
+
+		do {
+			if ( isset( $ec2_instance['PrivateIpAddress'] ) ) {
+				$ec2_instance_address = $ec2_instance['PrivateIpAddress'];
+			} else {
+				sleep( 1 );
+
+				$ec2_instance = get_instance( $ec2_instance_id );
+			}
+			
+		} while( ! $ec2_instance_address );
+
+		message( 'Installing necessary programs in temporal instance...' );
+
+		execute_remote_command( $ec2_instance_address, $key_pair_location, 'sudo apt-get update' );
+		execute_remote_command( $ec2_instance_address, $key_pair_location, sprintf( 'sudo apt-get install -y %s', implode( ' ', array_map( 'escapeshellarg', $programs ) ) ) );
+
+		$php_ini_file     = '/etc/php/7.0/apache2/php.ini';
+		$apache_conf_file = '/etc/apache2/apache2.conf';
+
+		execute_remote_command( $ec2_instance_address, $key_pair_location, sprintf( "sudo sed -i 's/mysqli\.default_host =/mysqli.default_host = %s/' %s", $db_instance_address, $php_ini_file ) );
+		execute_remote_command( $ec2_instance_address, $key_pair_location, sprintf( "sudo sed -i 's/mysqli\.default_user =/mysqli.default_user = %s/' %s", $database_username, $php_ini_file ) );
+		execute_remote_command( $ec2_instance_address, $key_pair_location, sprintf( "sudo sed -i 's/mysqli\.default_pw =/mysqli.default_pw = %s/' %s", $database_password, $php_ini_file ) );
+		execute_remote_command( $ec2_instance_address, $key_pair_location, sprintf( "sudo sed -i 's/AllowOverride None/AllowOverride All/' %s", $apache_conf_file ) );
+		execute_remote_command( $ec2_instance_address, $key_pair_location, sprintf( 'sudo chown www-data:www-data %s -R', $application_destination ) );
+		execute_remote_command( $ec2_instance_address, $key_pair_location, 'sudo a2enmod rewrite' );
+
+		message( sprintf( "Syncing application content. In the future you should use the command:\n\n%s\n",
+			sprintf(
+				'./deploy -a %s -s %s -d %s -k %s',
+				escapeshellarg( $autoscaling_group_name ),
+				escapeshellarg( $application_source ),
+				escapeshellarg( $application_destination ),
+				escapeshellarg( $key_pair_location )
+			)
+		) );
+
+		$files_mapping = array(
+			sprintf( '%s/', $application_source ) => $application_destination
+		);
+
+		if ( ! sync_content( $files_mapping, $key_pair_location, $ec2_instance_address ) ) {
+			throw new Exception( 'Cannot synchronize files.' );
+		}
+
+		message( 'Stopping temporal instance...' );
+
+		stop_instance( $ec2_instance_id );
+
+		message( 'Waiting temporal instance to be stopped...' );
+
+		wait_instance( $ec2_instance_id, array(
+			'state' => 'stopped',
+		) );
+
+		message( 'Creating image...' );
+
+		$ec2_image_id = create_image( $ec2_image_name, $ec2_instance_id );
+
+		message( 'Waiting image to be ready...' );
+
+		wait_image( $ec2_image_id );
+
+		message( 'Terminating temporal instance...' );
+
+		terminate_instance( $ec2_instance_id );
+
+		message( 'Creating load balancer...' );
+
+		$load_balancer = create_http_load_balancer( $load_balancer_name );
+
+		message( sprintf( 'Successfully created. Load balancer DNS name: %s', $load_balancer['DNSName'] ) );
+
+		message( 'Creating launch configuration...' );
+
+		create_launch_configuration( $launch_configuration_name, $ec2_image_id, array(
+			'InstanceType'   => $ec2_instance_type,
+			'SecurityGroups' => array( $security_group_instances ),
+		) );
+
+		message( 'Creating autoscaling group...' );
+
+		create_autoscaling_group( $autoscaling_group_name, $autoscaling_group_min_size, $autoscaling_group_max_size, $launch_configuration_name, $load_balancer_name, array(
+			$as_policy_scale_in  => array(
+				'Adjustment' => 1,
+				'Comparison' => 'GreaterThanOrEqualToThreshold',
+				'Metric'     => 'CPUUtilization',
+				'Threshold'  => 70,
+			),
+			$as_policy_scale_out => array(
+				'Adjustment' => -1,
+				'Comparison' => 'LessThanOrEqualToThreshold',
+				'Metric'     => 'CPUUtilization',
+				'Threshold'  => 20,
+			),
+		) );
+
+		message( 'Installation finished. Please wait the autoscaling system is up and running.' );
+	}
+} catch ( Exception $e ) {
+	error( $e->getMessage() );
+
+	$return = -1;
+}
+
+$elapsed_time = time() - $start_time;
+
+message( sprintf(
+	'Finished (Total time: %02d:%02d)',
+	floor( $elapsed_time / 60 ),
+	$elapsed_time % 60
+) );
+
+exit( $return );
